@@ -9,12 +9,13 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::adc::{Adc, Channel, Config, InterruptHandler};
 use embassy_rp::gpio;
-use embassy_rp::gpio::Pull;
+use gpio::Pull;
+use embassy_rp::spi;
 use embassy_rp::bind_interrupts;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
-use gpio::{Level, Output};
+use gpio::{Level, Output, Input};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -22,17 +23,12 @@ bind_interrupts!(struct Irqs {
 });
 
 // this feels clumsy? Can i create a single mutex for the whole bus?
-type BusOutType = Mutex<ThreadModeRawMutex, Option<Output<'static>>>;
-static BUS_OUT: [BusOutType; 8] = [
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-    Mutex::new(None),
-];
+type BusOutMutex = Mutex<ThreadModeRawMutex, Option<[Output<'static>; 8]>>;
+type BusInMutex = Mutex<ThreadModeRawMutex, Option<[Input<'static>; 4]>>;
+// type SpiTest = 
+type SpiMutex = Mutex<ThreadModeRawMutex, Option<spi::Spi<'static, embassy_rp::peripherals::SPI0, spi::Async>>>;
+static BUS_OUT: BusOutMutex = Mutex::new(None);
+static BUS_IN: BusInMutex = Mutex::new(None);
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -44,32 +40,30 @@ async fn main(_spawner: Spawner) {
     let mut p28 = Channel::new_pin(p.PIN_28, Pull::None);
     let mut ts = Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
 
+    let mut spi_: spi::Spi<'_, embassy_rp::peripherals::SPI0, spi::Async> = spi::Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi::Config::default());
+
     {
-        *(BUS_OUT[0].lock().await) = Some(Output::new(p.PIN_2, Level::Low));
+        *(BUS_OUT.lock().await) = Some([
+            Output::new(p.PIN_2, Level::Low),
+            Output::new(p.PIN_3, Level::Low),
+            Output::new(p.PIN_4, Level::Low),
+            Output::new(p.PIN_5, Level::Low),
+            Output::new(p.PIN_6, Level::Low),
+            Output::new(p.PIN_7, Level::Low),
+            Output::new(p.PIN_8, Level::Low),
+            Output::new(p.PIN_9, Level::Low)]);
     }
+
     {
-        *(BUS_OUT[1].lock().await) = Some(Output::new(p.PIN_3, Level::Low));
-    }
-    {
-        *(BUS_OUT[2].lock().await) = Some(Output::new(p.PIN_4, Level::Low));
-    }
-    {
-        *(BUS_OUT[3].lock().await) = Some(Output::new(p.PIN_5, Level::Low));
-    }
-    {
-        *(BUS_OUT[4].lock().await) = Some(Output::new(p.PIN_6, Level::Low));
-    }
-    {
-        *(BUS_OUT[5].lock().await) = Some(Output::new(p.PIN_7, Level::Low));
-    }
-    {
-        *(BUS_OUT[6].lock().await) = Some(Output::new(p.PIN_8, Level::Low));
-    }
-    {
-        *(BUS_OUT[7].lock().await) = Some(Output::new(p.PIN_9, Level::Low));
+        *(BUS_IN.lock().await) = Some([
+            Input::new(p.PIN_10, Pull::None),
+            Input::new(p.PIN_11, Pull::None),
+            Input::new(p.PIN_12, Pull::None),
+            Input::new(p.PIN_13, Pull::None)]);
     }
 
     unwrap!(_spawner.spawn(bus_out(&BUS_OUT)));
+    unwrap!(_spawner.spawn(bus_in(&BUS_IN)));
 
     loop {
         let level = adc.read(&mut p26).await.unwrap();
@@ -85,27 +79,60 @@ async fn main(_spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn bus_out(bus: &'static [BusOutType; 8]) {
+async fn bus_out(bus: &'static BusOutMutex) {
     let mut out_val = Wrapping(0u8);
 
     loop {
-        for (index, out) in bus.iter().enumerate() {
-            if (out_val.0 >> index & 0x01) != 0 {
-                let mut out_unlocked = out.lock().await;
-                if let Some(pin_ref) = out_unlocked.as_mut() {
-                    pin_ref.set_high();
+        // these brackets sets a scope that releases the mutex at the end
+        {
+            let mut bus_locked = bus.lock().await;
+            
+            if let Some(bus_ref) = bus_locked.as_mut() {
+                for (index, out) in bus_ref.iter_mut().enumerate(){
+                    if (out_val.0 >> index & 0x01) != 0 {
+                        out.set_high();
+                    } else {
+                        out.set_low();
+                    }
                 }
-            } else {
-                let mut out_unlocked = out.lock().await;
-            if let Some(pin_ref) = out_unlocked.as_mut() {
-                pin_ref.set_low();
-            }
             }
         }
+
         out_val += 1;
         Timer::after_secs(1).await;
     }
 }
+
+#[embassy_executor::task]
+async fn bus_in(bus: &'static BusInMutex) {
+    loop {
+        // these brackets sets a scope that releases the mutex at the end
+        {
+            let mut bus_locked = bus.lock().await;
+            
+            let mut in_val: u8 = 0;
+            if let Some(bus_ref) = bus_locked.as_mut() {
+                for (index, input) in bus_ref.iter_mut().enumerate(){
+                    if input.is_high(){
+                        in_val += 0x01 << index;
+                    }
+                }
+            }
+            info!("In bus {}", in_val);
+        }
+
+        Timer::after_secs(1).await;
+    }
+}
+
+async fn spi_tx(spi: &'static SpiMutex) {
+
+}
+
+async fn spi_rx(spi: &'static SpiMutex) {
+
+}
+
 
 fn convert_to_celsius(raw_temp: u16) -> f32 {
     // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
