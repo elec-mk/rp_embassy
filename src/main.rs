@@ -22,13 +22,13 @@ bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => InterruptHandler;
 });
 
-// this feels clumsy? Can i create a single mutex for the whole bus?
 type BusOutMutex = Mutex<ThreadModeRawMutex, Option<[Output<'static>; 8]>>;
 type BusInMutex = Mutex<ThreadModeRawMutex, Option<[Input<'static>; 4]>>;
 // type SpiTest = 
 type SpiMutex = Mutex<ThreadModeRawMutex, Option<spi::Spi<'static, embassy_rp::peripherals::SPI0, spi::Async>>>;
 static BUS_OUT: BusOutMutex = Mutex::new(None);
 static BUS_IN: BusInMutex = Mutex::new(None);
+static SPI_MUT: SpiMutex = Mutex::new(None);
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -40,7 +40,11 @@ async fn main(_spawner: Spawner) {
     let mut p28 = Channel::new_pin(p.PIN_28, Pull::None);
     let mut ts = Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
 
-    let mut spi_: spi::Spi<'_, embassy_rp::peripherals::SPI0, spi::Async> = spi::Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi::Config::default());
+    let spi_: spi::Spi<'_, embassy_rp::peripherals::SPI0, spi::Async> = spi::Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi::Config::default());
+
+    {
+        *(SPI_MUT.lock().await) = Some(spi_);
+    }
 
     {
         *(BUS_OUT.lock().await) = Some([
@@ -64,6 +68,8 @@ async fn main(_spawner: Spawner) {
 
     unwrap!(_spawner.spawn(bus_out(&BUS_OUT)));
     unwrap!(_spawner.spawn(bus_in(&BUS_IN)));
+    unwrap!(_spawner.spawn(spi_tx(&SPI_MUT)));
+    // unwrap!(_spawner.spawn(spi_rx(&SPI_MUT)));
 
     loop {
         let level = adc.read(&mut p26).await.unwrap();
@@ -89,11 +95,7 @@ async fn bus_out(bus: &'static BusOutMutex) {
             
             if let Some(bus_ref) = bus_locked.as_mut() {
                 for (index, out) in bus_ref.iter_mut().enumerate(){
-                    if (out_val.0 >> index & 0x01) != 0 {
-                        out.set_high();
-                    } else {
-                        out.set_low();
-                    }
+                    if (out_val.0 >> index & 0x01) != 0x00 { out.set_high()} else {out.set_low()}
                 }
             }
         }
@@ -125,12 +127,23 @@ async fn bus_in(bus: &'static BusInMutex) {
     }
 }
 
+#[embassy_executor::task]
 async fn spi_tx(spi: &'static SpiMutex) {
+    let mut tx_val = Wrapping(0u8);
+    let mut rx_buf = [0u8];
+    loop {
+        {
+            let mut spi_locked = spi.lock().await;
+            tx_val += 1;
+            info!("SPI Tx {}", tx_val.0);
 
-}
-
-async fn spi_rx(spi: &'static SpiMutex) {
-
+            if let Some(spi_ref) = spi_locked.as_mut() {
+                spi_ref.transfer(&mut rx_buf, &[tx_val.0]).await.unwrap();
+            }
+            info!("SPI Rx {:?}", rx_buf);
+        }
+        Timer::after_millis(1).await;
+    }
 }
 
 
